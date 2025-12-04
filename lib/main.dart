@@ -814,7 +814,7 @@ class _ControlScreenState extends State<ControlScreen> {
                 // Controls Row
                 Row(
                   children: [
-                    const Text("Resolve DNS"),
+                    const Text("Resolve DNS (Slower)"),
                     Switch(
                       value: _resolveDns,
                       onChanged: _isBusy
@@ -842,7 +842,7 @@ class _ControlScreenState extends State<ControlScreen> {
                   children: [
                     _ActionButton(
                       icon: Icons.network_check,
-                      label: "Ping",
+                      label: "Ping host",
                       onTap: _isBusy ? null : () => _sendCommand("ping"),
                     ),
                     _ActionButton(
@@ -852,7 +852,7 @@ class _ControlScreenState extends State<ControlScreen> {
                     ),
                     _ActionButton(
                       icon: Icons.alt_route,
-                      label: "Trace",
+                      label: "Trace route",
                       onTap: _isBusy ? null : () => _sendCommand("traceroute"),
                     ),
                     _ActionButton(
