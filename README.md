@@ -19,7 +19,7 @@
 
 # 🛠️ Architecture
 
-  * PyNetSketch Mobile follows a Distributed, many-to-many Client-Server Architecture:
+  * PyNetSketch Mobile follows a Distributed Client-Server Architecture:
     * The Probe (Server): A PC or Raspberry Pi running the main PyNetSketch Python application in "Server Mode". It handles raw socket operations (Scapy/Rust).
     * The Mobile App (Client): A Flutter app that connects via TCP Sockets to the Probe. It sends JSON commands and renders JSON responses.
 
