@@ -39,12 +39,17 @@ class DiscoveryScreen extends StatefulWidget {
 class _DiscoveryScreenState extends State<DiscoveryScreen> {
   final List<Map<String, dynamic>> _probes = [];
   bool _isScanning = false;
+  String _scanStatus = "Ready";
   RawDatagramSocket? _udpSocket;
+
+  // Interface selection
+  List<String> _availableIps = [];
+  String? _selectedSourceIp;
 
   @override
   void initState() {
     super.initState();
-    startDiscovery();
+    _refreshLocalIps();
   }
 
   @override
@@ -53,14 +58,65 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
     super.dispose();
   }
 
+  Future<void> _refreshLocalIps() async {
+    try {
+      List<String> ips = [];
+      List<NetworkInterface> interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLinkLocal: false,
+      );
+
+      for (var interface in interfaces) {
+        for (var addr in interface.addresses) {
+          if (!addr.isLoopback) {
+            ips.add(addr.address);
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _availableIps = ips;
+          // Auto-select the first private IP (usually 192.168... or 10...)
+          if (_selectedSourceIp == null && ips.isNotEmpty) {
+            _selectedSourceIp = ips.firstWhere(
+              (ip) =>
+                  ip.startsWith("192") ||
+                  ip.startsWith("10") ||
+                  ip.startsWith("172"),
+              orElse: () => ips.first,
+            );
+          }
+        });
+        // Start listening immediately after finding IP
+        if (_selectedSourceIp != null) startDiscovery();
+      }
+    } catch (e) {
+      debugPrint("Error getting IPs: $e");
+    }
+  }
+
   Future<void> startDiscovery() async {
+    if (_selectedSourceIp == null) {
+      setState(() => _scanStatus = "No Network Interface Selected");
+      return;
+    }
+
     setState(() {
       _probes.clear();
       _isScanning = true;
+      _scanStatus = "Listening on $_selectedSourceIp...";
     });
 
     try {
-      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      _udpSocket?.close();
+
+      // BIND SPECIFICALLY TO THE SELECTED IP
+      // This helps ensure we are using the correct network interface
+      _udpSocket = await RawDatagramSocket.bind(
+        InternetAddress(_selectedSourceIp!),
+        0,
+      );
       _udpSocket!.broadcastEnabled = true;
 
       _udpSocket!.listen((RawSocketEvent event) {
@@ -86,19 +142,303 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       });
 
       final data = utf8.encode("PYNET_DISCOVER");
-      _udpSocket!.send(data, InternetAddress("255.255.255.255"), 5051);
+
+      // 1. Broadcast to 255.255.255.255 (Local Subnet)
+      try {
+        _udpSocket!.send(data, InternetAddress("255.255.255.255"), 5051);
+      } catch (e) {
+        debugPrint("Broadcast error: $e");
+      }
+
+      // 2. Calculated Broadcast (e.g., 192.168.15.255)
+      try {
+        final parts = _selectedSourceIp!.split('.');
+        if (parts.length == 4) {
+          final broadcast = "${parts[0]}.${parts[1]}.${parts[2]}.255";
+          _udpSocket!.send(data, InternetAddress(broadcast), 5051);
+        }
+      } catch (e) {
+        debugPrint("Subnet broadcast error: $e");
+      }
 
       Future.delayed(const Duration(seconds: 5), () {
-        if (mounted) setState(() => _isScanning = false);
+        if (mounted && _isScanning && _scanStatus.contains("Listening")) {
+          setState(() => _isScanning = false);
+        }
       });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text("Discovery Error: $e")));
-        setState(() => _isScanning = false);
+        setState(() => _scanStatus = "Bind Error: $e");
+        _isScanning = false;
       }
     }
+  }
+
+  Future<void> _scanSpecificSubnet(String subnetPrefix) async {
+    if (_selectedSourceIp == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text("Select source IP first")));
+      return;
+    }
+
+    setState(() {
+      _isScanning = true;
+      _scanStatus = "Scanning $subnetPrefix.x from $_selectedSourceIp...";
+    });
+
+    RawDatagramSocket? senderSocket;
+    try {
+      // IMPORTANT: Bind to the specific WiFi IP.
+      // If we bind to anyIPv4, Android might route 192.168.3.x via Cellular gateway.
+      senderSocket = await RawDatagramSocket.bind(
+        InternetAddress(_selectedSourceIp!),
+        0,
+      );
+      final data = utf8.encode("PYNET_DISCOVER");
+
+      int sentCount = 0;
+      for (int i = 1; i < 255; i++) {
+        if (!mounted || !_isScanning) break;
+
+        final targetIp = "$subnetPrefix.$i";
+
+        // Update UI occasionally
+        if (i % 25 == 0) {
+          setState(() => _scanStatus = "Pinging $targetIp...");
+        }
+
+        try {
+          senderSocket.send(data, InternetAddress(targetIp), 5051);
+          sentCount++;
+        } catch (e) {
+          debugPrint("Send failed to $targetIp: $e");
+        }
+
+        // Throttle slightly (1ms) to prevent buffer overflow
+        if (i % 5 == 0) await Future.delayed(const Duration(milliseconds: 1));
+      }
+      debugPrint("Sent $sentCount packets via ${_selectedSourceIp}");
+    } catch (e) {
+      setState(() => _scanStatus = "Socket Error: $e");
+    } finally {
+      senderSocket?.close();
+    }
+
+    if (mounted) {
+      setState(() => _scanStatus = "Waiting for replies...");
+    }
+
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _isScanning = false);
+    });
+  }
+
+  void _showSubnetDialog() {
+    // Attempt to guess subnet based on current IP but allow editing
+    String defaultPrefix = "192.168.3";
+
+    final subnetController = TextEditingController(text: defaultPrefix);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Scan Remote Subnet"),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              "Send from: ${_selectedSourceIp ?? 'Unknown'}",
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              "Enter target subnet prefix (e.g. 192.168.3)",
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: subnetController,
+              decoration: const InputDecoration(
+                labelText: "Target Subnet",
+                border: OutlineInputBorder(),
+              ),
+              keyboardType: TextInputType.number,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("Cancel"),
+          ),
+          FilledButton(
+            onPressed: () {
+              final prefix = subnetController.text.trim();
+              if (prefix.isNotEmpty) {
+                final cleanPrefix = prefix.endsWith('.')
+                    ? prefix.substring(0, prefix.length - 1)
+                    : prefix;
+                Navigator.pop(ctx);
+                _scanSpecificSubnet(cleanPrefix);
+              }
+            },
+            child: const Text("Scan"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showManualConnectDialog() {
+    final ipController = TextEditingController();
+    bool isValidating = false;
+    String? errorText;
+    String? pingResult;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setState) {
+          return AlertDialog(
+            title: const Text("Manual Connect"),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: ipController,
+                    decoration: InputDecoration(
+                      labelText: "Probe IP Address",
+                      hintText: "e.g., 192.168.3.10",
+                      border: const OutlineInputBorder(),
+                      errorText: errorText,
+                    ),
+                    keyboardType: TextInputType.number,
+                    enabled: !isValidating,
+                  ),
+                  if (pingResult != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Text(
+                        pingResult!,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: pingResult!.contains("Success")
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                      ),
+                    ),
+                  if (isValidating)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 16.0),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          SizedBox(width: 10),
+                          Text("Checking..."),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: isValidating
+                    ? null
+                    : () async {
+                        // Test Connectivity (Simple TCP connect to common port or probe port)
+                        if (ipController.text.isEmpty) return;
+                        setState(() {
+                          isValidating = true;
+                          pingResult = null;
+                        });
+                        try {
+                          final socket = await Socket.connect(
+                            ipController.text,
+                            5050,
+                            timeout: const Duration(seconds: 2),
+                          );
+                          socket.destroy();
+                          setState(
+                            () => pingResult = "Success: Probe Port 5050 Open",
+                          );
+                        } catch (e) {
+                          setState(
+                            () => pingResult = "Failed: Unreachable or Blocked",
+                          );
+                        } finally {
+                          setState(() => isValidating = false);
+                        }
+                      },
+                child: const Text("Test Ping"),
+              ),
+              FilledButton(
+                onPressed: isValidating
+                    ? null
+                    : () async {
+                        if (ipController.text.isEmpty) return;
+
+                        setState(() {
+                          isValidating = true;
+                          errorText = null;
+                        });
+
+                        try {
+                          final socket = await Socket.connect(
+                            ipController.text,
+                            5050,
+                            timeout: const Duration(seconds: 5),
+                          );
+
+                          socket.write(jsonEncode({"action": "identify"}));
+
+                          await for (final data in socket) {
+                            final resp = jsonDecode(utf8.decode(data));
+                            socket.destroy();
+
+                            if (resp['status'] == 'ok') {
+                              if (!mounted) return;
+                              Navigator.pop(ctx);
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ControlScreen(
+                                    hostIp: ipController.text,
+                                    sessionName:
+                                        resp['session_name'] ?? "Manual Probe",
+                                  ),
+                                ),
+                              );
+                            } else {
+                              setState(() => errorText = "Refused.");
+                            }
+                            break;
+                          }
+                        } on SocketException catch (e) {
+                          setState(() => errorText = "Failed: ${e.message}");
+                        } catch (e) {
+                          setState(() => errorText = "Error: $e");
+                        } finally {
+                          if (mounted) setState(() => isValidating = false);
+                        }
+                      },
+                child: const Text("Connect"),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 
   @override
@@ -107,6 +447,16 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
       appBar: AppBar(
         title: const Text("Select Probe"),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.wifi_tethering),
+            tooltip: "Scan Subnet",
+            onPressed: _showSubnetDialog,
+          ),
+          IconButton(
+            icon: const Icon(Icons.add_link),
+            tooltip: "Manual Connect",
+            onPressed: _showManualConnectDialog,
+          ),
           _isScanning
               ? const Padding(
                   padding: EdgeInsets.all(16),
@@ -122,56 +472,126 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                 ),
         ],
       ),
-      body: _probes.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.radar, size: 80, color: Colors.grey),
-                  const SizedBox(height: 20),
-                  Text(
-                    _isScanning
-                        ? "Scanning local network..."
-                        : "No probes found.",
-                    style: const TextStyle(color: Colors.grey),
-                  ),
-                  if (!_isScanning)
-                    TextButton(
-                      onPressed: startDiscovery,
-                      child: const Text("Try Again"),
-                    ),
-                ],
-              ),
-            )
-          : ListView.builder(
-              itemCount: _probes.length,
-              itemBuilder: (context, index) {
-                final probe = _probes[index];
-                return Card(
-                  margin: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  child: ListTile(
-                    leading: const Icon(Icons.dns, color: Colors.cyanAccent),
-                    title: Text(probe['session_name'] ?? "Unknown"),
-                    subtitle: Text("${probe['ip']}:${probe['port']}"),
-                    trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-                    onTap: () {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => ControlScreen(
-                            hostIp: probe['ip'],
-                            sessionName: probe['session_name'],
+      body: Column(
+        children: [
+          // IP SELECTOR BAR
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: Colors.black26,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text("My IP:", style: TextStyle(color: Colors.grey)),
+                DropdownButton<String>(
+                  value: _selectedSourceIp,
+                  dropdownColor: Colors.grey[900],
+                  style: const TextStyle(color: Colors.cyanAccent),
+                  underline: Container(height: 1, color: Colors.cyan),
+                  items: _availableIps.map((ip) {
+                    return DropdownMenuItem(value: ip, child: Text(ip));
+                  }).toList(),
+                  onChanged: (val) {
+                    setState(() => _selectedSourceIp = val);
+                    startDiscovery();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 16),
+                  onPressed: _refreshLocalIps,
+                  tooltip: "Refresh IPs",
+                ),
+              ],
+            ),
+          ),
+
+          Expanded(
+            child: _probes.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.radar, size: 80, color: Colors.grey),
+                        const SizedBox(height: 20),
+                        Text(
+                          _isScanning ? _scanStatus : "No probes found.",
+                          style: const TextStyle(color: Colors.grey),
+                        ),
+                        if (_isScanning)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              "Scanning remote subnet...",
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.grey,
+                              ),
+                            ),
                           ),
+                        const SizedBox(height: 10),
+                        if (!_isScanning)
+                          Wrap(
+                            spacing: 10,
+                            alignment: WrapAlignment.center,
+                            children: [
+                              FilledButton.tonalIcon(
+                                onPressed: _showSubnetDialog,
+                                icon: const Icon(Icons.saved_search),
+                                label: const Text("Scan Subnet"),
+                              ),
+                              FilledButton.icon(
+                                onPressed: _showManualConnectDialog,
+                                icon: const Icon(Icons.keyboard),
+                                label: const Text("IP Manually"),
+                              ),
+                            ],
+                          ),
+                        if (!_isScanning)
+                          TextButton(
+                            onPressed: startDiscovery,
+                            child: const Text("Scan Local Again"),
+                          ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _probes.length,
+                    itemBuilder: (context, index) {
+                      final probe = _probes[index];
+                      return Card(
+                        margin: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        child: ListTile(
+                          leading: const Icon(
+                            Icons.dns,
+                            color: Colors.cyanAccent,
+                          ),
+                          title: Text(probe['session_name'] ?? "Unknown"),
+                          subtitle: Text("${probe['ip']}:${probe['port']}"),
+                          trailing: const Icon(
+                            Icons.arrow_forward_ios,
+                            size: 16,
+                          ),
+                          onTap: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ControlScreen(
+                                  hostIp: probe['ip'],
+                                  sessionName: probe['session_name'],
+                                ),
+                              ),
+                            );
+                          },
                         ),
                       );
                     },
                   ),
-                );
-              },
-            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -192,7 +612,7 @@ class ControlScreen extends StatefulWidget {
 }
 
 class _ControlScreenState extends State<ControlScreen> {
-  final _targetController = TextEditingController(text: "192.168.1.0/24");
+  final _targetController = TextEditingController(text: "8.8.8.8");
   bool _isBusy = false;
   bool _resolveDns = true;
 
@@ -394,7 +814,7 @@ class _ControlScreenState extends State<ControlScreen> {
                 // Controls Row
                 Row(
                   children: [
-                    const Text("Resolve DNS (Slower)"),
+                    const Text("Resolve DNS"),
                     Switch(
                       value: _resolveDns,
                       onChanged: _isBusy
@@ -422,7 +842,7 @@ class _ControlScreenState extends State<ControlScreen> {
                   children: [
                     _ActionButton(
                       icon: Icons.network_check,
-                      label: "Ping Host",
+                      label: "Ping",
                       onTap: _isBusy ? null : () => _sendCommand("ping"),
                     ),
                     _ActionButton(
@@ -432,7 +852,7 @@ class _ControlScreenState extends State<ControlScreen> {
                     ),
                     _ActionButton(
                       icon: Icons.alt_route,
-                      label: "Trace Route",
+                      label: "Trace",
                       onTap: _isBusy ? null : () => _sendCommand("traceroute"),
                     ),
                     _ActionButton(
@@ -544,10 +964,7 @@ class _ControlScreenState extends State<ControlScreen> {
                 color: Colors.green.withOpacity(0.1),
                 margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                 child: ListTile(
-                  leading: const Icon(
-                    Icons.login,
-                    color: Colors.green,
-                  ), // Changed icon to a standard one
+                  leading: const Icon(Icons.login, color: Colors.green),
                   title: Text(ports[i].toString()),
                 ),
               ),
